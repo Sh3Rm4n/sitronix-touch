@@ -1,6 +1,7 @@
 #![no_std]
 
 use embedded_hal_1::i2c::I2c;
+use embedded_hal_async::i2c::I2c as AsyncI2c;
 
 pub const DEFAULT_ADDR: u8 = 0x55;
 
@@ -24,10 +25,12 @@ pub struct TouchIC<I2C> {
     addr: u8,
 }
 
-impl<I2C> TouchIC<I2C>
-where
-    I2C: I2c,
-{
+pub struct AsyncTouchIC<I2C> {
+    i2c: I2C,
+    addr: u8,
+}
+
+impl<I2C> TouchIC<I2C> {
     pub fn new(i2c: I2C, addr: u8) -> Self {
         Self { i2c, addr }
     }
@@ -35,7 +38,22 @@ where
     pub fn new_default(i2c: I2C) -> Self {
         Self::new(i2c, DEFAULT_ADDR)
     }
+}
 
+impl<I2C> AsyncTouchIC<I2C> {
+    pub fn new(i2c: I2C, addr: u8) -> Self {
+        Self { i2c, addr }
+    }
+
+    pub fn new_default(i2c: I2C) -> Self {
+        Self::new(i2c, DEFAULT_ADDR)
+    }
+}
+
+impl<I2C> TouchIC<I2C>
+where
+    I2C: I2c,
+{
     pub fn init(&mut self) -> Result<(), I2C::Error> {
         self.wait_normal_status()?;
         Ok(())
@@ -114,6 +132,96 @@ where
     fn read_reg8(&mut self, reg: u8) -> Result<u8, I2C::Error> {
         let mut buf = [0u8; 1];
         self.i2c.write_read(self.addr, &[reg], &mut buf)?;
+        Ok(buf[0])
+    }
+}
+
+impl<I2C> AsyncTouchIC<I2C>
+where
+    I2C: AsyncI2c,
+{
+    pub async fn init(&mut self) -> Result<(), I2C::Error> {
+        self.wait_normal_status().await?;
+        Ok(())
+    }
+
+    pub async fn get_gesture_info(&mut self) -> Result<GestureInfo, I2C::Error> {
+        let raw = self.read_reg8(regs::ADVANCED_TOUCH_INFO).await?;
+        Ok(GestureInfo {
+            gesture_type: GestureType::from_u8(raw),
+            proximity: raw & 0b0100_0000 != 0,
+            water: raw & 0b0010_0000 != 0,
+        })
+    }
+
+    pub async fn get_point0(&mut self) -> Result<Option<Point>, I2C::Error> {
+        self.get_point(0).await
+    }
+
+    pub async fn get_point1(&mut self) -> Result<Option<Point>, I2C::Error> {
+        self.get_point(1).await
+    }
+
+    pub async fn get_point(&mut self, nth: u8) -> Result<Option<Point>, I2C::Error> {
+        if nth > 9 {
+            return Ok(None); // max 10 points
+        }
+        let start_reg = 0x12 + 4 * nth;
+        let mut buf = [0u8; 4];
+        self.i2c
+            .write_read(self.addr, &[start_reg], &mut buf)
+            .await?;
+
+        if buf[0] >> 7 == 0 {
+            Ok(None)
+        } else {
+            let x = (u16::from(buf[0] & 0b0111_0000) << 4) | u16::from(buf[1]);
+            let y = (u16::from(buf[0] & 0b0000_1111) << 8) | u16::from(buf[2]);
+            Ok(Some(Point { x, y }))
+        }
+    }
+
+    /// Sensing Counter Registers provide a frame-based scan counter for host to verify current scan rate.
+    pub async fn get_sensor_count(&mut self) -> Result<u16, I2C::Error> {
+        let mut buf = [0u8; 2];
+        self.i2c
+            .write_read(self.addr, &[regs::SENSING_COUNTER_L], &mut buf)
+            .await?;
+
+        Ok(u16::from_be_bytes(buf))
+    }
+
+    pub async fn get_capabilities(&mut self) -> Result<Capabilities, I2C::Error> {
+        let max_contacts = self.read_reg8(regs::CONTACT_COUNT_MAX).await?;
+        let misc_info = self.read_reg8(regs::MISC_INFO).await?;
+
+        let mut buf = [0u8; 3];
+        self.i2c
+            .write_read(self.addr, &[regs::XY_RESOLUTION_H], &mut buf)
+            .await?;
+
+        let x_res = ((u16::from(buf[0]) & 0b0111_0000) << 4) | u16::from(buf[1]);
+        let y_res = ((u16::from(buf[0]) & 0b0000_1111) << 8) | u16::from(buf[2]);
+
+        Ok(Capabilities {
+            max_touches: max_contacts,
+            max_x: x_res,
+            max_y: y_res,
+            smart_wake_up: misc_info & 0b1000_0000 != 0,
+        })
+    }
+
+    async fn wait_normal_status(&mut self) -> Result<(), I2C::Error> {
+        let mut status = self.read_reg8(regs::STATUS).await?;
+        while status & 0xf0 != 0 {
+            status = self.read_reg8(regs::STATUS).await?;
+        }
+        Ok(())
+    }
+
+    async fn read_reg8(&mut self, reg: u8) -> Result<u8, I2C::Error> {
+        let mut buf = [0u8; 1];
+        self.i2c.write_read(self.addr, &[reg], &mut buf).await?;
         Ok(buf[0])
     }
 }
